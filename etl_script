@@ -1,0 +1,276 @@
+# Import necessary modules and libraries
+import json
+import requests
+import os
+import logging
+import re
+import pandas as pd
+import psycopg2
+from sqlalchemy import create_engine, text
+from dotenv import load_dotenv
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Load environment variables
+load_dotenv()
+
+# Extraction layer via rapid API for the source data:
+url = "https://realty-mole-property-api.p.rapidapi.com/randomProperties"
+querystring = {"limit":"200000"}
+headers = {
+	"X-RapidAPI-Key": os.getenv('RAPID_KEY'),
+	"X-RapidAPI-Host": "realty-mole-property-api.p.rapidapi.com"
+}
+response = requests.get(url, headers=headers, params=querystring)
+
+# Save the data to a file
+data = response.json()
+fileName = 'rawData.json'
+with open(fileName, 'w') as file:
+    json.dump(data, file, indent=4)
+  
+
+# Load the JSON data into a DataFrame
+file_path = '/Users/akinro/Documents/10Alytics/Projects/Amdari Project1 - Zipco Real Estate ETL/rawData.json'
+raw_data = pd.read_json(file_path)
+
+# Database credentials
+DB_HOST = os.getenv('DB_HOST')
+DB_NAME = os.getenv('DB_NAME')
+DB_USER = os.getenv('DB_USER')
+DB_PASSWORD = os.getenv('DB_PASSWORD')
+DB_PORT = os.getenv('DB_PORT', '5432')
+
+# Function to flatten nested columns and handle year-specific data
+def flatten_columns(data, column):
+    col_df = pd.json_normalize(data[column])
+    # Dynamically rename columns based on pattern (e.g., '2023.value' to 'value_2023')
+    col_df.columns = [re.sub(r'(\d{4})\.(\w+)', r'\2_\1', col) for col in col_df.columns]
+    col_df['id'] = data['id']
+    data = data.drop(column, axis=1)
+    return pd.merge(data, col_df, on='id')
+
+# Flatten and rename columns dynamically for each specified nested column
+nested_columns = ['features', 'taxAssessment', 'propertyTaxes', 'owner.mailingAddress']
+for column in nested_columns:
+    if column in raw_data.columns:
+        raw_data = flatten_columns(raw_data, column)
+
+
+# Function to convert camelCase to snake_case
+def camel_to_snake(name):
+    s1 = re.sub('(.)([A-Z][a-z]+)', r'\1_\2', name)
+    return re.sub('([a-z0-9])([A-Z])', r'\1_\2', s1).lower()
+
+# Apply the camel_to_snake function to dataframe columns
+raw_data.columns = [camel_to_snake(column) for column in raw_data.columns]
+
+# Dictionary to specify fill values for each column, filling missing values appropriately:
+fillna_dict = {
+    'address_line2': '',
+    'bedrooms': 0,
+    'bathrooms': 0,
+    'square_footage': 0,
+    'year_built': 0,
+    'county': 'Unknown',
+    'assessor_id': 'Unknown',
+    'legal_description': 'Not available',
+    'subdivision': 'Not available',
+    'zoning': 'Unknown',
+    'owner_occupied': False,
+    'lot_size': 0,
+    'property_type': 'Unknown',
+    'last_sale_price': 0,
+    'last_sale_date': 'Not available',
+    'value_2020': 0,
+    'land_2020': 0,
+    'improvements_2020': 0,
+    'value_2021': 0,
+    'land_2021': 0,
+    'improvements_2021': 0,
+    'value_2022': 0,
+    'land_2022': 0,
+    'improvements_2022': 0,
+    'value_2023': 0,
+    'land_2023': 0,
+    'improvements_2023': 0,
+    'value_2024': 0,
+    'land_2024': 0,
+    'improvements_2024': 0,
+    'total_2018': 0,
+    'total_2020': 0,
+    'total_2021': 0,
+    'total_2022': 0,
+    'total_2023': 0,
+    'total_2024': 0,
+    'address_line1': 'Not available',
+    'city': 'Not available',
+    'state': 'Not available',
+    'zip_code': 'Not available',
+    'formatted_address': 'Not available',
+    'longitude': 0,
+    'latitude': 0,
+    'names': 'Unknown'
+}
+
+# Apply the fillna method to replace missing values based on the defined dictionary
+raw_data.fillna(fillna_dict, inplace=True)
+
+
+# Create dimension dataframes:
+dataframes = {
+    'features_dim': raw_data[['id', 'bedrooms', 'bathrooms', 'square_footage', 'lot_size', 'year_built', 'property_type']],
+    'location_dim': raw_data[['id', 'address_line1', 'address_line2', 'city', 'county', 'state', 'zip_code', 'longitude', 'latitude']],
+    'ownership_dim': raw_data[['id', 'assessor_id', 'legal_description', 'subdivision', 'zoning', 'owner_occupied']],
+    'financials_dim': raw_data[[
+        'id', 
+        'last_sale_price', 
+        'last_sale_date', 
+        'value_2020', 'land_2020', 'improvements_2020', 'total_2020',
+        'value_2021', 'land_2021', 'improvements_2021', 'total_2021',
+        'value_2022', 'land_2022', 'improvements_2022', 'total_2022',
+        'value_2023', 'land_2023', 'improvements_2023', 'total_2023',
+        'value_2024', 'land_2024', 'improvements_2024', 'total_2024',
+        'value_2019', 'land_2019', 'improvements_2019', 'total_2019',
+        'value_2018', 'land_2018', 'improvements_2018', 'total_2018',
+        'value_2017',
+        'value_2025', 'land_2025', 'improvements_2025',
+        'value_2013', 'land_2013', 'improvements_2013', 'total_2013'
+    ]]
+}
+
+
+# Optionally save to CSV for local backup
+features_dim.to_csv('features_dim.csv', index=False)
+financials_dim.to_csv('financials_dim.csv', index=False)
+location_dim.to_csv('location_dim.csv', index=False)
+ownership_dim.to_csv('ownership_dim.csv', index=False)
+
+# Function to get database engine
+def get_db_engine():
+    connection_string = f'postgresql://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}'
+    engine = create_engine(connection_string)
+    return engine
+
+
+# Function to set up the database
+def setup_database(engine):
+    with engine.connect() as connection:
+        # Create the schema:
+        connection.execute(text("CREATE SCHEMA IF NOT EXISTS zipco_real_estate;"))
+        
+        # Commit changes to ensure the schema is created
+        connection.commit()
+        
+        # Define SQL statements for creating tables
+        create_table_statements = {
+            'features_dim': """
+                CREATE TABLE IF NOT EXISTS zipco_real_estate.features_dim (
+                    id INT PRIMARY KEY,
+                    bedrooms FLOAT,
+                    bathrooms FLOAT,
+                    square_footage FLOAT,
+                    lot_size FLOAT,
+                    year_built INT,
+                    property_type VARCHAR(255)
+                );
+            """,
+            'financials_dim': """
+                CREATE TABLE IF NOT EXISTS zipco_real_estate.financials_dim (
+                    id INT PRIMARY KEY,
+                    last_sale_price FLOAT,
+                    last_sale_date DATE,
+                    value_2020 FLOAT,
+                    land_2020 FLOAT,
+                    improvements_2020 FLOAT,
+                    total_2020 FLOAT,
+                    value_2021 FLOAT,
+                    land_2021 FLOAT,
+                    improvements_2021 FLOAT,
+                    total_2021 FLOAT,
+                    value_2022 FLOAT,
+                    land_2022 FLOAT,
+                    improvements_2022 FLOAT,
+                    total_2022 FLOAT,
+                    value_2023 FLOAT,
+                    land_2023 FLOAT,
+                    improvements_2023 FLOAT,
+                    total_2023 FLOAT,
+                    value_2024 FLOAT,
+                    land_2024 FLOAT,
+                    improvements_2024 FLOAT,
+                    total_2024 FLOAT,
+                    value_2019 FLOAT,
+                    land_2019 FLOAT,
+                    improvements_2019 FLOAT,
+                    total_2019 FLOAT,
+                    value_2018 FLOAT,
+                    land_2018 FLOAT,
+                    improvements_2018 FLOAT,
+                    total_2018 FLOAT,
+                    value_2017 FLOAT,
+                    value_2025 FLOAT,
+                    land_2025 FLOAT,
+                    improvements_2025 FLOAT,
+                    value_2013 FLOAT,
+                    land_2013 FLOAT,
+                    improvements_2013 FLOAT,
+                    total_2013 FLOAT
+                );
+            """,
+            'location_dim': """
+                CREATE TABLE IF NOT EXISTS zipco_real_estate.location_dim (
+                    id INT PRIMARY KEY,
+                    address_line1 VARCHAR(255),
+                    address_line2 VARCHAR(255),
+                    city VARCHAR(255),
+                    county VARCHAR(255),
+                    state VARCHAR(255),
+                    zip_code INT,
+                    formatted_address VARCHAR(255),
+                    longitude FLOAT,
+                    latitude FLOAT
+                );
+            """,
+            'ownership_dim': """
+                CREATE TABLE IF NOT EXISTS zipco_real_estate.ownership_dim (
+                    id INT PRIMARY KEY,
+                    assessor_id VARCHAR(255),
+                    legal_description TEXT,
+                    subdivision VARCHAR(255),
+                    zoning VARCHAR(255),
+                    owner_occupied BOOLEAN
+                );
+            """
+        }
+        
+        # Execute SQL statements to create tables
+        for table_name, sql in create_table_statements.items():
+            connection.execute(text(sql))
+        # Ensure to commit if needed
+        connection.commit()
+
+
+# Load data to database
+def load_data_to_database(engine, dataframes):
+    for name, dataframe in dataframes.items():
+        table_name = f'zipco_real_estate.{name}'
+        dataframe.to_sql(name, con=engine, schema='zipco_real_estate', if_exists='replace', index=False)
+        logging.info(f"Data loaded into {table_name} successfully.")
+
+
+# Main execution
+if __name__ == "__main__":
+    engine = get_db_engine()
+    setup_database(engine)
+    dataframes = {
+        'features_dim': features_dim,
+        'financials_dim': financials_dim,
+        'location_dim': location_dim,
+        'ownership_dim': ownership_dim
+    }
+    load_data_to_database(engine, dataframes)
+    logging.info("ETL process completed successfully.")
+
